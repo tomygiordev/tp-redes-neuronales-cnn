@@ -3,6 +3,7 @@ keras==3.12.4
 scikit-learn==1.5.2
 matplotlib==3.9.2
 reportlab==4.2.5
+pypdf==6.0.0
 pytest==8.3.4
 numpy==1.26.4
 Pillow==12.3.0

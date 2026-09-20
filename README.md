@@ -2,6 +2,26 @@
 
 Clasificación de imágenes de CIFAR-10 con una red convolucional de Keras. Incluye entrenamiento reproducible, validación cruzada por lotes, diagnóstico empírico de sesgo/varianza, evaluación final, pesos exportados y un informe en español.
 
+**Entregables:** [informe técnico de cinco páginas](report/informe_cnn.pdf), [modelo entrenado](results/model.keras) y [resultados completos](results/results.json). Los scripts están escritos en inglés y el informe en español. Este repositorio resuelve únicamente el módulo CNN.
+
+## Resultados de la ejecución incluida
+
+Entrenamiento real en CPU: 10.000 imágenes de desarrollo, cinco folds por lote y 10.000 imágenes de prueba independientes. No se detectaron duplicados exactos. El modelo final se entrenó durante diez épocas fijadas mediante validación.
+
+| Medida | Resultado |
+| --- | ---: |
+| Accuracy media de validación | 53,22 % |
+| Desviación entre folds | 1,88 puntos porcentuales |
+| Accuracy de entrenamiento del modelo final | 59,91 % |
+| Accuracy de prueba | **53,42 %** |
+| F1 macro de prueba | **0,5218** |
+| Accuracy con desplazamiento de 2 píxeles | 39,62 % |
+| Diferencia de probabilidades al recargar el modelo | 0 |
+
+En el mismo holdout, la CNN alcanzó 52,15 % frente a 33,65 % del modelo lineal y 47,75 % de la CNN con la mitad de datos. El desempeño muestra aprendizaje, pero también errores importantes y sensibilidad a desplazamientos. Cuatro de cinco folds encontraron su mejor época en el límite del presupuesto: no se afirma haber alcanzado convergencia ni descartado todos los atajos visuales.
+
+![Curvas de aprendizaje de los cinco folds](results/cv_learning_curves.png)
+
 ## Ejecutar en Windows (Python 3.10)
 
 ```powershell
@@ -9,6 +29,7 @@ py -3.10 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m pytest -q
 .\.venv\Scripts\python.exe train.py --epochs 10 --samples-per-batch 2000 --threads 4
+.\.venv\Scripts\python.exe build_report.py
 .\.venv\Scripts\python.exe infer.py ruta\a\imagen.png --model results/model.keras
 ```
 
@@ -40,7 +61,9 @@ La selección del mejor estado monitoriza pérdida que incluye L2; `cross_entrop
 - `results/predictions.npz`: etiquetas y probabilidades OOF, test y test desplazado.
 - `results/*png`: curvas, matriz de confusión y primeras 18 predicciones del test (sin seleccionar por acierto).
 
-Las semillas y operaciones deterministas facilitan reproducir resultados en el mismo entorno. Diferencias de hardware y versiones pueden producir pequeñas variaciones. Las pruebas no descargan el dataset ni ejecutan entrenamiento completo.
+Las semillas y operaciones deterministas facilitan reproducir resultados en el mismo entorno. Diferencias de hardware y versiones pueden producir pequeñas variaciones. Las pruebas no descargan el dataset ni ejecutan entrenamiento completo. `requirements-lock.txt` registra todas las versiones del entorno Windows/Python 3.10 utilizado; se puede instalar con `pip install -r requirements-lock.txt` para fijar también las dependencias indirectas.
+
+`build_report.py` reconstruye el PDF desde los JSON y gráficos de la ejecución y verifica el límite de cinco páginas. Si se usa otro directorio de resultados: `python build_report.py --results results_otro --output report/informe_otro.pdf`. Conviene revisar visualmente el informe después de cada nueva ejecución.
 
 ## Fuentes
 
