@@ -1,75 +1,87 @@
-# TP Redes Neuronales — Parte 1: CNN
+# TP Redes Neuronales: parte CNN
 
-Clasificación de imágenes de CIFAR-10 con una red convolucional de Keras. Incluye entrenamiento reproducible, validación cruzada por lotes, diagnóstico empírico de sesgo/varianza, evaluación final, pesos exportados y un informe en español.
+Clasificación de señales de tránsito de GTSRB con una CNN de Keras. El trabajo incluye una separación por señales físicas, tres entrenamientos con distintas semillas, una referencia lineal y la evaluación del modelo exportado. El informe ocupa tres páginas para dejar espacio a la parte RNN en el documento conjunto.
 
-**Entregables:** [informe técnico de cinco páginas](report/informe_cnn.pdf), [modelo entrenado](results/model.keras) y [resultados completos](results/results.json). Los scripts están escritos en inglés y el informe en español. Este repositorio resuelve únicamente el módulo CNN.
+**Entregables:** [informe CNN](report/informe_cnn.pdf), [modelo entrenado](results/model.keras), [resultados completos](results/results.json) y [manifiesto de particiones](results/split_manifest.csv).
 
-## Resultados de la ejecución incluida
+## Datos y separación
 
-Entrenamiento real en CPU: 10.000 imágenes de desarrollo, cinco folds por lote y 10.000 imágenes de prueba independientes. No se detectaron duplicados exactos. El modelo final se entrenó durante diez épocas fijadas mediante validación.
+GTSRB tiene 43 clases. Cada *track* agrupa fotogramas de una misma señal física. El identificador combina clase y track, porque el número de track puede repetirse entre clases. Se reserva aproximadamente el 20 % de los tracks de cada clase para validación, con semilla 42. Ningún track se reparte entre entrenamiento y validación.
+
+La revisión encontró ocho imágenes de desarrollo con los mismos píxeles RGB que imágenes del test oficial. Pertenecían al track `00014/00023`, de la clase Stop. Se excluyeron sus 30 fotogramas completos después de fijar la partición. La validación y el test conservaron todas sus imágenes.
+
+| Partición | Imágenes | Tracks |
+| --- | ---: | ---: |
+| Entrenamiento | 31.350 | 1.045 |
+| Validación | 7.829 | 261 |
+| Excluidas por coincidencias con test | 30 | 1 |
+| Test oficial | 12.630 | No identificados en los nombres públicos |
+
+El control compara píxeles originales y preprocesados; no usa etiquetas ni desempeño del test para decidir qué excluir. El manifiesto conserva las 39.209 imágenes originales de desarrollo, incluidas las exclusiones con su motivo. El programa verifica que no haya grupos compartidos entre entrenamiento y validación ni coincidencias exactas entre las tres particiones usadas.
+
+Hubo una evaluación anterior a esta limpieza. El entrenamiento corregido conserva arquitectura, hiperparámetros, semillas y validación. El cambio responde a duplicados encontrados en los datos, sin ajustar el modelo al resultado previo. En la ejecución corregida, el test se usa para el control de duplicados y, al terminar los entrenamientos de desarrollo, para evaluar la CNN principal.
+
+## Modelo y procedimiento
+
+Todas las imágenes se convierten a RGB y se redimensionan a 32 × 32 con interpolación bilineal. El modelo divide los píxeles por 255. Se usa la imagen completa suministrada por GTSRB, sin recortes adicionales ni aumentos de datos.
+
+La CNN tiene tres bloques `Conv2D + MaxPooling2D`, con 16, 32 y 64 filtros de 3 × 3. Sigue una capa densa de 64 unidades, dropout de 0,3 y una salida softmax de 43 clases. Suma 91.979 parámetros entrenables. Usa ReLU e inicialización He en las capas ocultas, Adam con tasa 0,001, lotes de 128 imágenes y L2 de 0,0001 en los kernels convolucionales y de la capa densa oculta. `clipnorm=1` se conserva como precaución del diseño original; no se demostró que fuera necesario.
+
+Cada corrida empieza con pesos nuevos y admite hasta 30 épocas. Early stopping observa la pérdida de validación, espera cinco épocas sin mejora y restaura los mejores pesos. Las semillas 42, 43 y 44 cambian la inicialización y el orden de entrenamiento sobre la misma partición. La semilla 42 está fijada como modelo principal; no se elige por su posición entre las tres. No se reentrena con las imágenes de validación.
+
+La referencia lineal usa los mismos píxeles y particiones, con una única capa softmax de 132.139 parámetros. Esta comparación permite contrastar el ajuste de ambas familias de modelos. No aísla el efecto de la convolución, porque también cambian la profundidad, las activaciones y la regularización.
+
+## Resultados
+
+Resultados de la ejecución corregida, con las 30 imágenes excluidas y todos los controles de coincidencias en cero.
 
 | Medida | Resultado |
 | --- | ---: |
-| Accuracy media de validación | 53,22 % |
-| Desviación entre folds | 1,88 puntos porcentuales |
-| Accuracy de entrenamiento del modelo final | 59,91 % |
-| Accuracy de prueba | **53,42 %** |
-| F1 macro de prueba | **0,5218** |
-| Accuracy con desplazamiento de 2 píxeles | 39,62 % |
-| Diferencia de probabilidades al recargar el modelo | 0 |
+| Accuracy media de validación, tres semillas | 95,55 % |
+| Desviación muestral entre semillas | 0,48 puntos porcentuales |
+| Accuracy de entrenamiento, CNN principal | 99,88 % |
+| Accuracy de validación, CNN principal | 95,18 % |
+| Accuracy de validación, referencia lineal | 84,97 % |
+| Accuracy de test, CNN principal | 92,61 % |
+| F1 macro de test, CNN principal | 0,8969 |
 
-En el mismo holdout, la CNN alcanzó 52,15 % frente a 33,65 % del modelo lineal y 47,75 % de la CNN con la mitad de datos. El desempeño muestra aprendizaje, pero también errores importantes y sensibilidad a desplazamientos. Cuatro de cinco folds encontraron su mejor época en el límite del presupuesto: no se afirma haber alcanzado convergencia ni descartado todos los atajos visuales.
+![Curvas de entrenamiento y validación](results/learning_curves.png)
 
-![Curvas de aprendizaje de los cinco folds](results/cv_learning_curves.png)
+Las curvas registran el entrenamiento con dropout activo y pesos que cambian durante cada época. Las métricas finales de entrenamiento se calculan con los pesos restaurados y dropout desactivado; por eso pueden diferir. La pérdida de las curvas incluye L2. La entropía cruzada informada en las tablas finales lo excluye.
 
-## Ejecutar en Windows (Python 3.10)
+F1 macro da el mismo peso a cada clase, mientras accuracy cuenta aciertos por imagen. La [matriz de confusión](results/test_confusion_matrix.png) usa colores normalizados por fila y muestra los conteos en las celdas. `results.json` también incluye precisión, recall, F1 y soporte por clase.
+
+La CNN principal tiene un error de entrenamiento del 0,12 % y una brecha de 4,69 puntos porcentuales con validación. Ajusta los datos de entrenamiento, pero conserva errores ante otras señales: hay sobreajuste residual. La referencia lineal alcanza 94,27 % en entrenamiento y 84,97 % en validación; su brecha es mayor (9,30 puntos). No corresponde atribuir su menor resultado únicamente a sesgo alto. Dos corridas de la CNN alcanzaron el máximo de 30 épocas; ese límite impide asegurar que su pérdida ya no pudiera mejorar. La dispersión entre tres semillas mide sensibilidad a la inicialización y al orden de entrenamiento en esta partición. No es validación cruzada ni una estimación de variabilidad entre muestras; tampoco constituye una descomposición estadística de sesgo y varianza.
+
+## Reproducir en Windows con Python 3.10
 
 ```powershell
 py -3.10 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\python.exe train.py --epochs 10 --samples-per-batch 2000 --threads 4
-.\.venv\Scripts\python.exe build_report.py
-.\.venv\Scripts\python.exe infer.py ruta\a\imagen.png --model results/model.keras
+.\.venv\Scripts\python.exe train.py --epochs 30 --threads 4 --output results_nuevo
+.\.venv\Scripts\python.exe build_report.py --results results_nuevo --output report/informe_nuevo.pdf
+.\.venv\Scripts\python.exe infer.py ruta\a\imagen.png --model results_nuevo/model.keras
 ```
 
-El entrenamiento descarga CIFAR-10 en `.cache/keras` (no se versiona). La configuración predeterminada selecciona 2.000 imágenes por cada uno de los cinco lotes originales: **10.000 imágenes de desarrollo**, no las 50.000 originales. `--samples-per-batch 0` usa todo el conjunto de desarrollo después de eliminar duplicados exactos. El test conserva todas las imágenes que superan la depuración. Cada nueva ejecución reemplaza `results/`; usar `--output results_otro` para preservar resultados anteriores. El entrenamiento completo puede demorar considerablemente en CPU.
+Los archivos oficiales se descargan en `.cache/gtsrb`. El entrenamiento completo puede demorar en CPU. El ejemplo guarda una nueva ejecución para conservar los entregables incluidos. Para regenerar el informe incluido, ejecutar `build_report.py` sin argumentos.
 
-## Arquitectura y protocolo
+`requirements-lock.txt` registra el entorno utilizado. Los resultados guardan versiones, configuración, hashes de los archivos descargados y del manifiesto. El hash SHA-256 del archivo de entrenamiento se calcula localmente: permite identificar la copia usada, pero no es una referencia de autenticidad publicada de manera independiente.
 
-Entrada RGB 32×32, reescalado interno de 0–255 a 0–1; tres bloques Conv2D de 16/32/64 filtros 3×3, stride 1, padding `same`, ReLU y MaxPooling2D 2×2 con stride 2. Luego Flatten, Dense(64), dropout 0,3 y softmax de 10 clases. Inicialización He, regularización L2 de 0,0001, Adam 0,001 con `clipnorm=1`. La salida de cada bloque tiene forma 16×16×16, 8×8×32 y 4×4×64. No hay aumentación aleatoria ni normalización estimada del test.
+## Archivos y alcance
 
-1. Se eliminan imágenes exactamente iguales por SHA256 de píxeles originales antes de muestrear. Se conserva la primera aparición; desarrollo tiene prioridad sobre test. Las etiquetas no intervienen.
-2. El muestreo estratificado y determinista se hace dentro de cada lote de desarrollo. `GroupKFold(5)` deja un lote completo para validación por pliegue. Cada muestra obtiene una sola predicción fuera de su entrenamiento (OOF).
-3. Cada pliegue entrena desde cero, con early stopping por pérdida de validación, paciencia 3 y restauración del mejor estado. Las métricas de entrenamiento se vuelven a calcular en inferencia, sin dropout, para comparar con validación.
-4. Dos diagnósticos usan exclusivamente el holdout del primer pliegue: regresión softmax sobre píxeles reducidos y la CNN con la mitad del entrenamiento. Permiten examinar capacidad y cantidad de datos sin consultar test.
-5. La mediana de las mejores épocas de los cinco pliegues fija la duración del ajuste final sobre todo desarrollo. El test original depurado se evalúa después de fijar estas decisiones. Se realiza además una prueba de robustez predefinida: traslación de 2 píxeles hacia abajo y derecha, con relleno negro.
+- `data.py`: descarga, preprocesamiento, separación por tracks y controles de duplicados.
+- `cnn.py`: CNN y referencia lineal.
+- `train.py`: entrenamientos, evaluación y gráficos.
+- `infer.py`: clasificación de una imagen con el modelo exportado.
+- `test_cnn.py`: pruebas de particiones, exclusiones, preprocesamiento y guardado/carga.
+- `build_report.py`: informe de tres páginas generado a partir de los resultados corregidos.
 
-La selección del mejor estado monitoriza pérdida que incluye L2; `cross_entropy` en los JSON es solamente la entropía cruzada de las probabilidades, sin regularización. Las curvas de entrenamiento durante el ajuste incluyen dropout; el análisis de brechas usa las métricas recalculadas en inferencia. Desvío entre pliegues se calcula con `ddof=1`; no representa un intervalo de confianza.
-
-**Límites:** los lotes originales son particiones del dataset, no grupos verificados de cámaras, pacientes o escenas. Evitar mezclar lotes permite cumplir una validación por lotes, pero no demuestra generalización a fuentes nuevas. El hash detecta duplicados exactos, no imágenes visualmente parecidas. Un conjunto pequeño y pocas épocas limitan la precisión; los diagnósticos de sesgo y varianza son indicios empíricos, no una descomposición estadística formal. La robustez ante un desplazamiento no demuestra invariancia general. No se ajustan hiperparámetros a partir del test.
-
-## Archivos
-
-- `cnn.py`: preparación de datos, particiones y arquitectura.
-- `train.py`: entrenamiento y generación de resultados reales.
-- `infer.py`: inferencia sobre una imagen RGB redimensionada a 32×32. La salida incluye probabilidades; no se garantiza calibración ni desempeño fuera de CIFAR-10.
-- `test_cnn.py`: pruebas de duplicados, particiones, selección determinista y equivalencia al recargar.
-- `results/model.keras`: modelo completo entrenado, con pesos y reescalado interno.
-- `results/results.json`: métricas, curvas, diagnósticos, versiones y configuración.
-- `results/data_manifest.json`: conteos, grupos, índices seleccionados y hashes para auditoría.
-- `results/predictions.npz`: etiquetas y probabilidades OOF, test y test desplazado.
-- `results/*png`: curvas, matriz de confusión y primeras 18 predicciones del test (sin seleccionar por acierto).
-
-Las semillas y operaciones deterministas facilitan reproducir resultados en el mismo entorno. Diferencias de hardware y versiones pueden producir pequeñas variaciones. Las pruebas no descargan el dataset ni ejecutan entrenamiento completo. `requirements-lock.txt` registra todas las versiones del entorno Windows/Python 3.10 utilizado; se puede instalar con `pip install -r requirements-lock.txt` para fijar también las dependencias indirectas.
-
-`build_report.py` reconstruye el PDF desde los JSON y gráficos de la ejecución y verifica el límite de cinco páginas. Si se usa otro directorio de resultados: `python build_report.py --results results_otro --output report/informe_otro.pdf`. Conviene revisar visualmente el informe después de cada nueva ejecución.
+Las pruebas usan datos sintéticos; no descargan GTSRB ni entrenan el experimento completo. El modelo clasifica imágenes de señales ya recortadas: no localiza señales en fotografías completas. La evaluación corresponde a GTSRB y no garantiza el mismo desempeño con señales de otros países, cámaras o condiciones. La separación por tracks y la limpieza de duplicados reducen fugas concretas; no prueban que el dataset esté libre de todo atajo visual.
 
 ## Fuentes
 
-- [CIFAR-10, Alex Krizhevsky — descripción y descarga oficial](https://www.cs.toronto.edu/~kriz/cifar.html).
-- [Keras CIFAR-10](https://keras.io/api/datasets/cifar10/).
-- [Keras Conv2D](https://keras.io/api/layers/convolution_layers/convolution2d/).
-- [GroupKFold, scikit-learn](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.GroupKFold.html).
-
-No se distribuye el dataset en este repositorio. Las métricas del trabajo provienen de la ejecución guardada; cambiar la configuración exige volver a generar y revisar el informe.
+- [GTSRB: artículo original de Stallkamp y colaboradores](https://christian-igel.github.io/paper/MvCBMLAfTSR.pdf)
+- [Archivos oficiales de GTSRB](https://sid.erda.dk/public/archives/daaeac0d7ce1152aea9b61d9f1e19370/published-archive.html)
+- [Conv2D en Keras](https://keras.io/api/layers/convolution_layers/convolution2d/)
+- [MaxPooling2D en Keras](https://keras.io/api/layers/pooling_layers/max_pooling2d/)

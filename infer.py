@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from cnn import CLASS_NAMES
+from data import preprocess_image
 
 
 def main():
@@ -17,7 +18,9 @@ def main():
     import tensorflow as tf
     model = tf.keras.models.load_model(args.model)
     with Image.open(args.image) as image:
-        pixels = np.asarray(image.convert("RGB").resize((32, 32), Image.Resampling.BILINEAR))
+        pixels = preprocess_image(image)
+    if model.output_shape[-1] != len(CLASS_NAMES):
+        parser.error("The model is not a 43-class GTSRB model")
     probabilities = model(pixels[None], training=False).numpy()[0]
     order = np.argsort(probabilities)[::-1]
     print(json.dumps({CLASS_NAMES[i]: float(probabilities[i]) for i in order}, indent=2))

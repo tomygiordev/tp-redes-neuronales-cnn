@@ -1,9 +1,9 @@
-"""Reproducible group-CV development, diagnostic experiments and final test."""
+"""Train on GTSRB with track-disjoint validation and one reserved official test."""
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-import hashlib
+import importlib.metadata
 import json
 import os
 from pathlib import Path
@@ -12,84 +12,81 @@ import time
 
 import numpy as np
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score, log_loss
-from sklearn.model_selection import StratifiedShuffleSplit
 
-from cnn import CLASS_NAMES, build_model, deduplicate, group_splits, select_development
+from cnn import CLASS_NAMES, build_model
+from data import ARCHIVES, BASE_URL, audit_partitions, exclude_test_overlap_tracks, load_gtsrb, split_tracks, write_manifest
+
+MAIN_SEED = 42
+RUN_SEEDS = (42, 43, 44)
+SPLIT_SEED = 42
 
 
 def metrics(labels, probabilities):
     predictions = probabilities.argmax(axis=1)
+    class_ids = np.arange(len(CLASS_NAMES))
     return {"accuracy": float(accuracy_score(labels, predictions)),
-            "macro_f1": float(f1_score(labels, predictions, average="macro", zero_division=0)),
-            "cross_entropy": float(log_loss(labels, probabilities, labels=np.arange(10))),
-            "confusion_matrix": confusion_matrix(labels, predictions, labels=np.arange(10)).tolist(),
-            "classification_report": classification_report(labels, predictions, labels=np.arange(10),
+            "macro_f1": float(f1_score(labels, predictions, labels=class_ids, average="macro", zero_division=0)),
+            "cross_entropy": float(log_loss(labels, probabilities, labels=class_ids)),
+            "confusion_matrix": confusion_matrix(labels, predictions, labels=class_ids).tolist(),
+            "classification_report": classification_report(labels, predictions, labels=class_ids,
                                                             target_names=CLASS_NAMES, output_dict=True, zero_division=0)}
 
 
 def predict(model, x, batch_size=128):
-    # Direct batched calls avoid a second tf.data threadpool at inference.
     return np.concatenate([model(x[i:i + batch_size], training=False).numpy()
                            for i in range(0, len(x), batch_size)])
-
-
-def shifted(x):
-    result = np.zeros_like(x)
-    result[:, 2:, 2:, :] = x[:, :-2, :-2, :]
-    return result
 
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def plot_results(output, folds, final_history, test_metrics, test_x, test_y, test_probs):
+def plot_results(output, runs, test_metrics):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    for fold in folds:
-        h = fold["history"]
-        epochs = np.arange(1, len(h["loss"]) + 1)
-        axes[0].plot(epochs, h["accuracy"], alpha=.55, label=f"F{fold['fold']} train")
-        axes[0].plot(epochs, h["val_accuracy"], "--", label=f"F{fold['fold']} val")
-        axes[1].plot(epochs, h["loss"], alpha=.55)
-        axes[1].plot(epochs, h["val_loss"], "--")
-    axes[0].set(title="Group CV: accuracy", xlabel="Epoch", ylabel="Accuracy", ylim=(0, 1))
-    axes[1].set(title="Group CV: regularized loss", xlabel="Epoch", ylabel="Loss")
+    for run, color in zip(runs, ("#2563eb", "#d97706", "#16a34a")):
+        history = run["history"]
+        epochs = np.arange(1, len(history["loss"]) + 1)
+        for axis, metric in zip(axes, ("accuracy", "loss")):
+            axis.plot(epochs, history[metric], color=color, alpha=.65, label=f"Seed {run['seed']} train")
+            axis.plot(epochs, history[f"val_{metric}"], "--", color=color, label=f"Seed {run['seed']} val")
+            axis.axvline(run["best_epoch"], color=color, alpha=.2, linewidth=.8)
+    axes[0].set(title="Track-disjoint validation: accuracy", xlabel="Epoch", ylabel="Accuracy", ylim=(0, 1))
+    axes[1].set(title="CNN regularized objective (includes L2)", xlabel="Epoch", ylabel="Loss")
     axes[0].legend(ncol=2, fontsize=7)
-    fig.tight_layout(); fig.savefig(output / "cv_learning_curves.png", dpi=160); plt.close(fig)
-    fig, ax = plt.subplots(figsize=(8, 7))
+    fig.tight_layout()
+    fig.savefig(output / "learning_curves.png", dpi=180)
+    plt.close(fig)
+    fig, ax = plt.subplots(figsize=(17, 15))
     cm = np.array(test_metrics["confusion_matrix"])
-    im = ax.imshow(cm, cmap="Blues")
-    ax.set(xticks=range(10), yticks=range(10), xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES,
-           xlabel="Predicted", ylabel="True", title="Final held-out test: counts")
-    plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
-    for row in range(10):
-        for col in range(10):
-            ax.text(col, row, str(cm[row, col]), ha="center", va="center", fontsize=7,
-                    color="white" if cm[row, col] > cm.max() / 2 else "black")
-    fig.colorbar(im, ax=ax); fig.tight_layout(); fig.savefig(output / "test_confusion_matrix.png", dpi=160); plt.close(fig)
-    fig, axes = plt.subplots(3, 6, figsize=(12, 7))
-    for i, ax in enumerate(axes.flat):
-        ax.imshow(test_x[i]); ax.axis("off")
-        guess = int(test_probs[i].argmax())
-        ax.set_title(f"True: {CLASS_NAMES[test_y[i]]}\nPred: {CLASS_NAMES[guess]}",
-                     fontsize=9, color="green" if guess == test_y[i] else "crimson")
-    fig.tight_layout(); fig.savefig(output / "sample_predictions.png", dpi=160); plt.close(fig)
+    normalized = cm / cm.sum(axis=1, keepdims=True)
+    im = ax.imshow(normalized, cmap="Blues", vmin=0, vmax=1)
+    ax.set(xticks=range(len(CLASS_NAMES)), yticks=range(len(CLASS_NAMES)),
+           xticklabels=range(len(CLASS_NAMES)),
+           yticklabels=[f"{i}: {name}" for i, name in enumerate(CLASS_NAMES)],
+           xlabel="Predicted class ID", ylabel="True class", title="Official test: row-normalized confusion matrix")
+    ax.tick_params(axis="both", labelsize=8)
+    for row, col in zip(*np.nonzero(cm)):
+        ax.text(col, row, str(cm[row, col]), ha="center", va="center", fontsize=5,
+                color="white" if normalized[row, col] > .5 else "black")
+    fig.colorbar(im, ax=ax, label="Fraction within true class", shrink=.7)
+    fig.tight_layout()
+    fig.savefig(output / "test_confusion_matrix.png", dpi=180)
+    plt.close(fig)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--samples-per-batch", type=int, default=2000, help="0 uses all development images")
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--threads", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path, default=Path("results"))
+    parser.add_argument("--cache", type=Path, default=Path(".cache/gtsrb"))
     args = parser.parse_args()
-    if args.epochs < 1 or args.samples_per_batch < 0 or args.batch_size < 1 or args.threads < 1:
-        parser.error("epochs, batch-size and threads must be positive; samples-per-batch must be nonnegative")
+    if args.epochs < 1 or args.batch_size < 1 or args.threads < 1:
+        parser.error("epochs, batch-size and threads must be positive")
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
     os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
     os.environ.setdefault("KERAS_HOME", str(Path(__file__).resolve().parent / ".cache" / "keras"))
@@ -99,110 +96,89 @@ def main():
     tf.config.experimental.enable_op_determinism()
     args.output.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
-    print("Loading CIFAR-10; checking exact duplicates before sampling...", flush=True)
-    (x, y), (test_x, test_y) = tf.keras.datasets.cifar10.load_data()
-    y, test_y = y.reshape(-1), test_y.reshape(-1)
-    groups = np.repeat(np.arange(1, 6), 10000)
-    x, y, test_x, test_y, groups, duplicate_stats = deduplicate(x, y, test_x, test_y, groups)
-    x, y, groups, selected = select_development(x, y, groups, args.samples_per_batch, args.seed)
-    splits = group_splits(x, y, groups)
-    print(f"Development={len(x)}, test={len(test_x)}, duplicates={duplicate_stats}", flush=True)
-    manifest = {"dataset": "CIFAR-10", "original_train_count": 50000, "original_test_count": 10000,
-                "development_count": len(x), "test_count": len(test_x), "deduplication": duplicate_stats,
-                "group_definition": "Original CIFAR-10 data_batch_1 through data_batch_5; not capture/source groups",
-                "class_names": CLASS_NAMES, "seed": args.seed, "samples_per_batch": args.samples_per_batch,
-                "groups": {str(g): int(np.sum(groups == g)) for g in np.unique(groups)},
-                "development_pixels_sha256": hashlib.sha256(x.tobytes()).hexdigest(),
-                "test_pixels_sha256": hashlib.sha256(test_x.tobytes()).hexdigest(),
-                "selected_indices_into_deduplicated_train": selected.tolist()}
-    write_json(args.output / "data_manifest.json", manifest)
+    print("Loading official GTSRB archives...", flush=True)
+    data, archive_hashes = load_gtsrb(args.cache)
+    x, y, groups = data["development_x"], data["development_y"], data["development_groups"]
+    train_ids, val_ids = split_tracks(y, groups, SPLIT_SEED)
+    train_ids, val_ids, excluded_ids, exclusions = exclude_test_overlap_tracks(data, train_ids, val_ids)
+    integrity = audit_partitions(data, train_ids, val_ids)
+    manifest_hash = write_manifest(args.output / "split_manifest.csv", data, train_ids, val_ids, excluded_ids)
+    print(f"Train={len(train_ids)}, validation={len(val_ids)}, test={len(data['test_y'])}; integrity={integrity}", flush=True)
+    dataset_info = {
+        "name": "GTSRB (official final training and test sets)", "source_urls": [BASE_URL + name for name in ARCHIVES],
+        "archive_hashes": archive_hashes, "training_sha256_provenance": "Locally computed, not an independently published reference",
+        "original_development_count": len(y), "development_count": len(train_ids) + len(val_ids),
+        **exclusions, "train_count": len(train_ids), "validation_count": len(val_ids),
+        "test_count": len(data["test_y"]), "train_groups": len(np.unique(groups[train_ids])),
+        "validation_groups": len(np.unique(groups[val_ids])), "test_groups": None,
+        "test_group_note": "Test filenames omit track IDs; official test partition is documented as track-disjoint",
+        "class_count": len(CLASS_NAMES), "class_names": CLASS_NAMES, "split_seed": SPLIT_SEED,
+        "validation_track_fraction": .2, "split_hash": manifest_hash, "integrity": integrity,
+        "preprocessing": "RGB, full provided image, bilinear resize to 32x32; model rescales by 1/255",
+        "class_counts": {name: np.bincount(labels, minlength=len(CLASS_NAMES)).tolist() for name, labels in
+                         (("train", y[train_ids]), ("validation", y[val_ids]), ("test", data["test_y"]))},
+    }
 
-    class EpochLog(tf.keras.callbacks.Callback):
-        def __init__(self, name):
-            super().__init__(); self.name = name
-
-        def on_epoch_end(self, epoch, logs=None):
-            print(f"{self.name} epoch {epoch + 1}: " + " ".join(f"{k}={v:.4f}" for k, v in (logs or {}).items()), flush=True)
-
-    def dataset(images, labels, training):
+    def dataset(images, labels, training, seed):
         ds = tf.data.Dataset.from_tensor_slices((images, labels))
         if training:
-            ds = ds.shuffle(len(images), seed=args.seed, reshuffle_each_iteration=True)
+            ds = ds.shuffle(len(images), seed=seed, reshuffle_each_iteration=True)
         ds = ds.batch(args.batch_size)
         options = tf.data.Options()
         options.threading.private_threadpool_size = 1
         options.threading.max_intra_op_parallelism = args.threads
         return ds.with_options(options).prefetch(1)
 
-    def fit(model, name, train_ids, val_ids=None, epochs=None):
-        callbacks = [EpochLog(name)]
-        if val_ids is not None:
-            callbacks.append(tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True))
-        history = model.fit(dataset(x[train_ids], y[train_ids], True),
-                            validation_data=dataset(x[val_ids], y[val_ids], False) if val_ids is not None else None,
-                            epochs=epochs or args.epochs, verbose=0, callbacks=callbacks)
-        return {key: [float(v) for v in values] for key, values in history.history.items()}
+    def fit(seed, baseline=False):
+        tf.keras.backend.clear_session()
+        model = build_model(seed, baseline=baseline)
+        print(f"{'Linear reference' if baseline else 'CNN'} seed={seed}", flush=True)
+        history = model.fit(dataset(x[train_ids], y[train_ids], True, seed),
+                            validation_data=dataset(x[val_ids], y[val_ids], False, seed),
+                            epochs=args.epochs, verbose=2,
+                            callbacks=[tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=5,
+                                                                        restore_best_weights=True)])
+        history = {key: [float(v) for v in values] for key, values in history.history.items()}
+        entry = {"seed": seed, "parameter_count": model.count_params(),
+                 "best_epoch": int(np.argmin(history["val_loss"]) + 1), "history": history,
+                 "train": metrics(y[train_ids], predict(model, x[train_ids], args.batch_size)),
+                 "validation": metrics(y[val_ids], predict(model, x[val_ids], args.batch_size))}
+        return model, entry
 
-    folds = []
-    oof = np.zeros((len(x), 10), dtype=np.float32)
-    for fold, (train_ids, val_ids) in enumerate(splits, 1):
-        tf.keras.backend.clear_session()
-        model = build_model(args.seed + fold)
-        history = fit(model, f"CV {fold}/5", train_ids, val_ids)
-        val_probs = predict(model, x[val_ids])
-        oof[val_ids] = val_probs
-        entry = {"fold": fold, "train_groups": np.unique(groups[train_ids]).tolist(),
-                 "validation_groups": np.unique(groups[val_ids]).tolist(), "train_count": len(train_ids),
-                 "validation_count": len(val_ids), "best_epoch": int(np.argmin(history["val_loss"]) + 1),
-                 "history": history, "train": metrics(y[train_ids], predict(model, x[train_ids])),
-                 "validation": metrics(y[val_ids], val_probs)}
-        folds.append(entry)
-        write_json(args.output / "cv_progress.json", folds)
-    fixed_epochs = max(1, int(np.median([f["best_epoch"] for f in folds])))
-    # Diagnostics use only the same development holdout as fold 1.
-    train_ids, val_ids = splits[0]
-    diagnostic_results = {}
-    for name, baseline, fraction in (("linear_baseline", True, 1.0), ("half_training_data", False, .5)):
-        ids = train_ids
-        if fraction < 1:
-            local, _ = next(StratifiedShuffleSplit(n_splits=1, train_size=fraction, random_state=args.seed).split(ids, y[ids]))
-            ids = ids[local]
-        tf.keras.backend.clear_session()
-        model = build_model(args.seed + 1, baseline=baseline)
-        history = fit(model, name, ids, val_ids)
-        diagnostic_results[name] = {"train_count": len(ids), "validation_count": len(val_ids), "history": history,
-                                    "train": metrics(y[ids], predict(model, x[ids])),
-                                    "validation": metrics(y[val_ids], predict(model, x[val_ids]))}
-    tf.keras.backend.clear_session()
-    model = build_model(args.seed + 100)
-    summary_lines = []
-    model.summary(print_fn=lambda line, **kwargs: summary_lines.append(line))
-    (args.output / "model_summary.txt").write_text("\n".join(summary_lines), encoding="utf-8")
-    final_history = fit(model, "Final development fit", np.arange(len(x)), epochs=fixed_epochs)
-    model.save(args.output / "model.keras")
-    reloaded = tf.keras.models.load_model(args.output / "model.keras")
-    reload_error = float(np.max(np.abs(predict(model, x[:32]) - predict(reloaded, x[:32]))))
-    # Final test becomes visible only after architecture and epoch decisions are frozen.
-    test_probs = predict(reloaded, test_x)
-    test_metrics = metrics(test_y, test_probs)
-    shift_probs = predict(reloaded, shifted(test_x))
-    fold_acc = [f["validation"]["accuracy"] for f in folds]
     results = {"created_utc": datetime.now(timezone.utc).isoformat(),
-               "versions": {"python": platform.python_version(), "tensorflow": tf.__version__, "numpy": np.__version__},
-               "config": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-               "elapsed_seconds": time.monotonic() - start, "folds": folds,
-               "cv_accuracy_mean": float(np.mean(fold_acc)), "cv_accuracy_std": float(np.std(fold_acc, ddof=1)),
-               "oof": metrics(y, oof), "diagnostics": diagnostic_results,
-               "final_epochs": fixed_epochs, "final_history": final_history,
-               "final_train": metrics(y, predict(reloaded, x)), "test": test_metrics,
-               "robustness_shift_2px": metrics(test_y, shift_probs), "reload_max_abs_error": reload_error}
+               "versions": {"python": platform.python_version(), **{package: importlib.metadata.version(package)
+                            for package in ("tensorflow", "keras", "numpy", "scikit-learn", "Pillow", "matplotlib")}},
+               "dataset": dataset_info,
+               "config": {**{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+                          "early_stopping_patience": 5, "selection_metric": "val_loss", "cnn_seeds": list(RUN_SEEDS),
+                          "learning_rate": .001, "l2": .0001, "dropout": .3, "clipnorm": 1.0},
+               "main_seed": MAIN_SEED, "main_seed_policy": "Fixed before training; no selection among seeds",
+               "runs": [], "exported_model": "model.keras"}
+    for seed in RUN_SEEDS:
+        model, entry = fit(seed)
+        results["runs"].append(entry)
+        if seed == MAIN_SEED:
+            model.save(args.output / "model.keras")
+            lines = []
+            model.summary(print_fn=lambda line, **kwargs: lines.append(line))
+            (args.output / "model_summary.txt").write_text("\n".join(lines), encoding="utf-8")
+        write_json(args.output / "development_results.json", results)
+        del model
+    model, results["baseline"] = fit(MAIN_SEED, baseline=True)
+    del model
+    accuracies = [run["validation"]["accuracy"] for run in results["runs"]]
+    results["validation_accuracy_mean"] = float(np.mean(accuracies))
+    results["validation_accuracy_std"] = float(np.std(accuracies, ddof=1))
+    write_json(args.output / "development_results.json", results)
+    # All development runs are complete before this sole official-test model evaluation.
+    tf.keras.backend.clear_session()
+    model = tf.keras.models.load_model(args.output / "model.keras")
+    results["test"] = metrics(data["test_y"], predict(model, data["test_x"], args.batch_size))
+    results["elapsed_seconds"] = time.monotonic() - start
     write_json(args.output / "results.json", results)
-    np.savez_compressed(args.output / "predictions.npz", development_labels=y, groups=groups,
-                        oof_probabilities=oof, test_labels=test_y, test_probabilities=test_probs,
-                        shifted_test_probabilities=shift_probs)
-    plot_results(args.output, folds, final_history, test_metrics, test_x, test_y, test_probs)
-    print(f"DONE: CV accuracy={results['cv_accuracy_mean']:.4f}; test accuracy={test_metrics['accuracy']:.4f}; "
-          f"macro-F1={test_metrics['macro_f1']:.4f}; results={args.output.resolve()}", flush=True)
+    plot_results(args.output, results["runs"], results["test"])
+    print(f"DONE: validation mean={results['validation_accuracy_mean']:.4f}; "
+          f"test accuracy={results['test']['accuracy']:.4f}; macro-F1={results['test']['macro_f1']:.4f}", flush=True)
 
 
 if __name__ == "__main__":
